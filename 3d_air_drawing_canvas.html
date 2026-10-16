@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <!-- Optimized for tablets and mobile devices -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>3D Air Drawing</title>
+    
+    <!-- Tailwind CSS for UI styling -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- Three.js for 3D rendering -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    
+    <!-- MediaPipe Hands for Hand Tracking -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #111; touch-action: none; font-family: 'Inter', sans-serif; }
+        
+        /* Container holds both the video feed and the 3D canvas */
+        #container { position: relative; width: 100vw; height: 100vh; }
+        
+        /* Video is mirrored so it acts like a natural mirror */
+        #input_video {
+            position: absolute;
+            top: 0; left: 0;
+            width: 100%; height: 100%;
+            object-fit: cover;
+            transform: scaleX(-1); /* Mirror the video */
+            opacity: 0.4; /* Fade it so the 3D drawing pops out */
+            z-index: 1;
+        }
+        
+        /* Three.js canvas sits on top of the video */
+        #draw_canvas {
+            position: absolute;
+            top: 0; left: 0;
+            width: 100%; height: 100%;
+            z-index: 2;
+            pointer-events: none; /* Let clicks pass through if needed */
+        }
+        
+        /* UI sits on top of everything */
+        #ui_layer {
+            position: absolute;
+            top: 0; left: 0;
+            width: 100%; height: 100%;
+            z-index: 10;
+            pointer-events: none; /* Let touches pass to canvas if we added touch controls later */
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            padding: 1rem;
+        }
+        
+        .pointer-events-auto { pointer-events: auto; }
+        
+        /* Loading overlay */
+        #loading {
+            position: absolute; inset: 0;
+            background: rgba(0,0,0,0.8);
+            display: flex; justify-content: center; align-items: center;
+            flex-direction: column; color: white; z-index: 50;
+            transition: opacity 0.5s;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="loading">
+        <svg class="animate-spin h-10 w-10 text-blue-500 mb-4" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+            <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+        </svg>
+        <h2 class="text-xl font-bold">Initializing AI Camera...</h2>
+        <p class="text-gray-400 mt-2 text-center max-w-md">Please allow camera access. Pinch your index finger and thumb to draw in 3D.</p>
+    </div>
+
+    <div id="container">
+        <!-- Webcam Feed -->
+        <video id="input_video" autoplay playsinline></video>
+        
+        <!-- 3D Render Canvas -->
+        <canvas id="draw_canvas"></canvas>
+        
+        <!-- User Interface -->
+        <div id="ui_layer">
+            <div class="flex justify-between items-start">
+                <div class="bg-black/50 backdrop-blur-md text-white px-4 py-2 rounded-xl pointer-events-auto shadow-lg border border-white/10">
+                    <h1 class="font-bold text-lg">3D Air Canvas</h1>
+                    <div class="flex items-center gap-2 mt-1">
+                        <div id="status_dot" class="w-3 h-3 rounded-full bg-red-500"></div>
+                        <span id="status_text" class="text-sm text-gray-300">Tracking Paused</span>
+                    </div>
+                </div>
+                
+                <button id="clear_btn" class="bg-red-600 hover:bg-red-500 text-white px-6 py-3 rounded-xl font-bold pointer-events-auto shadow-lg shadow-red-500/30 transition-all active:scale-95">
+                    Clear Canvas
+                </button>
+            </div>
+            
+            <div class="text-center pb-4 text-white/50 text-sm pointer-events-none">
+                Pinch Index & Thumb to Draw
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // --- 1. Three.js Setup ---
+        const canvasElement = document.getElementById('draw_canvas');
+        const videoElement = document.getElementById('input_video');
+        
+        const scene = new THREE.Scene();
+        // Transparent background so the video shows through
+        const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.z = 5;
+
+        const renderer = new THREE.WebGLRenderer({ canvas: canvasElement, alpha: true, antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2)); // Optimize for tablets
+
+        // Lighting
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+        scene.add(ambientLight);
+        const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
+        directionalLight.position.set(0, 10, 5);
+        scene.add(directionalLight);
+
+        // Drawing State
+        let isDrawing = false;
+        let currentLine = null;
+        let currentPositions = [];
+        
+        // Group to hold all drawn lines so we can clear them easily
+        const drawingGroup = new THREE.Group();
+        scene.add(drawingGroup);
+
+        // Resize handler
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // Clear Canvas function
+        document.getElementById('clear_btn').addEventListener('click', () => {
+            // Remove all children from the group
+            while(drawingGroup.children.length > 0){ 
+                const child = drawingGroup.children[0];
+                drawingGroup.remove(child);
+                if(child.geometry) child.geometry.dispose();
+                if(child.material) child.material.dispose();
+            }
+        });
+
+        // Helper to convert MediaPipe normalized coordinates (0-1) to Three.js 3D space
+        function mapTo3D(x, y, z) {
+            // Because the video is horizontally mirrored via CSS, we must invert the X mapping
+            const mappedX = -((x * 2) - 1); 
+            const mappedY = -((y * 2) - 1);
+            
+            // Create a vector in normalized device coordinates (NDC)
+            // We use a fixed depth (e.g., 0.5) and add the hand's z offset to it
+            const vector = new THREE.Vector3(mappedX, mappedY, 0.5);
+            vector.unproject(camera);
+            
+            // Z from MediaPipe is depth relative to the wrist. 
+            // We scale it to make it visible in 3D space.
+            const dir = vector.sub(camera.position).normalize();
+            const distance = -camera.position.z / dir.z; // Base distance to Z=0 plane
+            
+            const pos = camera.position.clone().add(dir.multiplyScalar(distance));
+            // Apply MediaPipe Z offset (scaled)
+            pos.z += (z * -15); 
+            
+            return pos;
+        }
+
+        // --- 2. MediaPipe Hands Setup ---
+        
+        function onResults(results) {
+            // Hide loading screen on first result
+            const loadingUI = document.getElementById('loading');
+            if(loadingUI.style.display !== 'none') {
+                loadingUI.style.opacity = '0';
+                setTimeout(() => loadingUI.style.display = 'none', 500);
+            }
+
+            const statusDot = document.getElementById('status_dot');
+            const statusText = document.getElementById('status_text');
+
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                // Hand detected
+                statusDot.classList.replace('bg-red-500', 'bg-green-500');
+                statusText.innerText = "Hand Detected";
+                
+                const landmarks = results.multiHandLandmarks[0]; // Use first hand detected
+                
+                // Get Index Tip (8) and Thumb Tip (4)
+                const thumbTip = landmarks[4];
+                const indexTip = landmarks[8];
+                
+                // Calculate distance to detect a "pinch"
+                const dx = indexTip.x - thumbTip.x;
+                const dy = indexTip.y - thumbTip.y;
+                const dist = Math.sqrt(dx*dx + dy*dy);
+                
+                // Threshold for pinching (usually around 0.04 - 0.06 in normalized coords)
+                const isPinching = dist < 0.05;
+                
+                // Calculate mid-point between thumb and index for the drawing brush tip
+                const midX = (indexTip.x + thumbTip.x) / 2;
+                const midY = (indexTip.y + thumbTip.y) / 2;
+                const midZ = (indexTip.z + thumbTip.z) / 2;
+                
+                const brushPos = mapTo3D(midX, midY, midZ);
+
+                if (isPinching) {
+                    statusText.innerText = "Drawing...";
+                    if (!isDrawing) {
+                        // Start a new line
+                        isDrawing = true;
+                        currentPositions = [];
+                        
+                        // Create a thick glowing material
+                        const material = new THREE.MeshBasicMaterial({ 
+                            color: new THREE.Color(`hsl(${Math.random() * 360}, 100%, 60%)`), 
+                        });
+                        
+                        // We use a tube/sphere approach for thick lines, but dynamically building a tube is complex.
+                        // Instead, we will place interconnected spheres or just a dynamic BufferGeometry line for performance on tablets.
+                        // Let's use a simple Line for real-time performance.
+                        const geometry = new THREE.BufferGeometry();
+                        const lineMaterial = new THREE.LineBasicMaterial({ 
+                            color: new THREE.Color(`hsl(${Math.random() * 360}, 100%, 60%)`),
+                            linewidth: 5 // Note: WebGL standard limits linewidth to 1 on most platforms, but we'll request 5.
+                        });
+                        
+                        currentLine = new THREE.Line(geometry, lineMaterial);
+                        // Store an array of Vector3 inside the object for updates
+                        currentLine.userData.points = []; 
+                        drawingGroup.add(currentLine);
+                    }
+                    
+                    // Add point to current line
+                    if(currentLine) {
+                        currentLine.userData.points.push(brushPos);
+                        currentLine.geometry.setFromPoints(currentLine.userData.points);
+                        currentLine.geometry.computeBoundingSphere();
+                        
+                        // Add a small sphere at the tip to make it look thicker/bubbly
+                        const sphereGeom = new THREE.SphereGeometry(0.04, 8, 8);
+                        const sphereMat = new THREE.MeshBasicMaterial({ color: currentLine.material.color });
+                        const sphere = new THREE.Mesh(sphereGeom, sphereMat);
+                        sphere.position.copy(brushPos);
+                        drawingGroup.add(sphere);
+                    }
+                } else {
+                    isDrawing = false;
+                    currentLine = null;
+                }
+            } else {
+                // No hands detected
+                statusDot.classList.replace('bg-green-500', 'bg-red-500');
+                statusText.innerText = "No Hands Detected";
+                isDrawing = false;
+                currentLine = null;
+            }
+            
+            // Render the 3D scene
+            renderer.render(scene, camera);
+        }
+
+        const hands = new Hands({locateFile: (file) => {
+            return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+        }});
+        
+        hands.setOptions({
+            maxNumHands: 1, // Track 1 hand for better performance on tablets
+            modelComplexity: 1,
+            minDetectionConfidence: 0.6,
+            minTrackingConfidence: 0.6
+        });
+        
+        hands.onResults(onResults);
+
+        // --- 3. Camera Setup ---
+        const cameraUtils = new Camera(videoElement, {
+            onFrame: async () => {
+                await hands.send({image: videoElement});
+            },
+            width: 1280,
+            height: 720,
+            facingMode: 'user' // Front camera for tablet
+        });
+        
+        // Start camera and handle permissions
+        cameraUtils.start().catch(err => {
+            console.error("Camera error:", err);
+            document.getElementById('loading').innerHTML = `
+                <div class="text-red-500 bg-black p-6 rounded-xl border border-red-500 text-center">
+                    <h2 class="text-xl font-bold mb-2">Camera Access Denied</h2>
+                    <p>Please grant camera permissions to use this AR app.</p>
+                </div>
+            `;
+        });
+        
+        // Initial render call to clear black screen
+        renderer.render(scene, camera);
+
+    </script>
+</body>
+</html>
